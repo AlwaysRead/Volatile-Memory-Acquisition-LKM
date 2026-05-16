@@ -1,0 +1,1 @@
+savedcmd_mem_acquire.ko := ld -r -m elf_x86_64 -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T /usr/lib/modules/7.0.5-arch1-1-g14/build/scripts/module.lds -o mem_acquire.ko mem_acquire.o mem_acquire.mod.o .module-common.o

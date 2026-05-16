@@ -1,3 +1,6 @@
+/* Must be defined before any include to expose madvise, MADV_SEQUENTIAL */
+#define _GNU_SOURCE
+
 /*
  * dump_tool.c - Userspace acquisition tool for /dev/memdump
  * Version: 2.1.0
@@ -11,12 +14,13 @@
  *   - Chain-of-custody JSON sidecar
  *
  * Build:
- *   gcc -O2 -Wall -std=c11 dump_tool.c -lssl -lcrypto -o dump_tool
+ *   gcc -O2 -Wall -std=gnu11 dump_tool.c -lssl -lcrypto -o dump_tool
  *
  * Usage:
  *   sudo ./dump_tool [--mmap] [--out <file>]
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

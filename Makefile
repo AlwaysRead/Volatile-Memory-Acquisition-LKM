@@ -30,8 +30,8 @@ EXTRA_CFLAGS += -Wno-BTF
 
 # ---- Userspace tool flags --------------------------------------------------
 
-CFLAGS_RELEASE := -O2 -Wall -Wextra -Wno-unused-result -std=c11
-CFLAGS_DEBUG   := -g -O0 -Wall -Wextra -DDEBUG -fsanitize=address -std=c11
+CFLAGS_RELEASE := -O2 -Wall -Wextra -Wno-unused-result -std=gnu11
+CFLAGS_DEBUG   := -g -O0 -Wall -Wextra -DDEBUG -fsanitize=address -std=gnu11
 LDFLAGS        := -lssl -lcrypto
 
 # ---- Default target --------------------------------------------------------
