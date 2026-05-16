@@ -27,7 +27,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <openssl/sha.h>
+#include <openssl/evp.h>
 
 /* ---- ioctl definitions (must match kernel module) ----------------------- */
 
@@ -69,7 +69,8 @@ static void write_sidecar(const char *out_path,
                            size_t acquired,
                            unsigned long long ts_ns,
                            const char *kver,
-                           const unsigned char *sha256)
+                           const unsigned char *sha256,
+                           unsigned int sha256_len)
 {
     char sidecar_path[512];
     FILE *f;
@@ -94,7 +95,7 @@ static void write_sidecar(const char *out_path,
     fprintf(f, "  \"acq_timestamp_ns\": %llu,\n", ts_ns);
     fprintf(f, "  \"utc_time\"        : \"%s\",\n", timebuf);
     fprintf(f, "  \"sha256\"          : \"");
-    for (i = 0; i < SHA256_DIGEST_LENGTH; i++)
+    for (i = 0; i < sha256_len; i++)
         fprintf(f, "%02x", sha256[i]);
     fprintf(f, "\"\n}\n");
 
@@ -111,7 +112,7 @@ static void write_sidecar(const char *out_path,
  */
 static int acquire_chunked(int fd, FILE *out,
                             size_t total_size,
-                            SHA256_CTX *sha_ctx)
+                            EVP_MD_CTX *sha_ctx)
 {
     char *buf;
     ssize_t bytes;
@@ -129,7 +130,7 @@ static int acquire_chunked(int fd, FILE *out,
             free(buf);
             return -1;
         }
-        SHA256_Update(sha_ctx, buf, (size_t)bytes);
+        EVP_DigestUpdate(sha_ctx, buf, (size_t)bytes);
         acquired += (size_t)bytes;
         progress(acquired, total_size);
     }
@@ -150,7 +151,7 @@ static int acquire_chunked(int fd, FILE *out,
  */
 static int acquire_mmap(int fd, FILE *out,
                          size_t total_size,
-                         SHA256_CTX *sha_ctx)
+                         EVP_MD_CTX *sha_ctx)
 {
     void *mapped;
     size_t offset = 0;
@@ -182,7 +183,7 @@ static int acquire_mmap(int fd, FILE *out,
             ret = -1;
             break;
         }
-        SHA256_Update(sha_ctx, (char *)mapped + offset, chunk);
+        EVP_DigestUpdate(sha_ctx, (char *)mapped + offset, chunk);
         offset += chunk;
         progress(offset, total_size);
     }
@@ -201,8 +202,9 @@ int main(int argc, char *argv[])
     int use_mmap = 0;
     const char *out_path = DEFAULT_OUTPUT;
 
-    SHA256_CTX sha_ctx;
-    unsigned char sha256[SHA256_DIGEST_LENGTH];
+    EVP_MD_CTX *sha_ctx;
+    unsigned char sha256[EVP_MAX_MD_SIZE];
+    unsigned int  sha256_len = 0;
 
     size_t total_size        = 0;
     unsigned long long ts_ns = 0;
@@ -253,11 +255,18 @@ int main(int argc, char *argv[])
     }
 
     /* ---- Acquire -------------------------------------------------------- */
-    SHA256_Init(&sha_ctx);
+    sha_ctx = EVP_MD_CTX_new();
+    if (!sha_ctx) {
+        fprintf(stderr, "EVP_MD_CTX_new failed\n");
+        fclose(out);
+        close(fd);
+        return 1;
+    }
+    EVP_DigestInit_ex(sha_ctx, EVP_sha256(), NULL);
 
     int ret = use_mmap
-        ? acquire_mmap(fd, out, total_size, &sha_ctx)
-        : acquire_chunked(fd, out, total_size, &sha_ctx);
+        ? acquire_mmap(fd, out, total_size, sha_ctx)
+        : acquire_chunked(fd, out, total_size, sha_ctx);
 
     fclose(out);
     close(fd);
@@ -268,7 +277,8 @@ int main(int argc, char *argv[])
     }
 
     /* ---- Finalise hash -------------------------------------------------- */
-    SHA256_Final(sha256, &sha_ctx);
+    EVP_DigestFinal_ex(sha_ctx, sha256, &sha256_len);
+    EVP_MD_CTX_free(sha_ctx);
 
     /* Get actual written size from output file */
     struct stat st;
@@ -278,11 +288,11 @@ int main(int argc, char *argv[])
 
     printf("  Written:        %.1f MB\n", actual_size / (1024.0 * 1024.0));
     printf("  SHA-256:        ");
-    print_hash(sha256, SHA256_DIGEST_LENGTH);
+    print_hash(sha256, sha256_len);
     printf("\n\n");
 
     /* ---- Write chain-of-custody sidecar --------------------------------- */
-    write_sidecar(out_path, actual_size, ts_ns, kver, sha256);
+    write_sidecar(out_path, actual_size, ts_ns, kver, sha256, sha256_len);
 
     printf("Done.\n\n");
     return 0;
