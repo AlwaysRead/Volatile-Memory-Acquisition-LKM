@@ -2,6 +2,12 @@
 /*
  * mem_acquire.c - Read-only volatile memory acquisition LKM
  *
+ * Kernel compatibility:
+ *   - 5.x  : kmap_local_page (replaces kmap_atomic, removed in 5.11)
+ *   - 6.3+ : vm_flags_set() (vm_flags became read-only)
+ *   - 6.4+ : class_create() no longer takes THIS_MODULE
+ *   - 7.x  : all of the above; tested on 7.0.0-15-generic
+ *
  * For DFIR / cybersecurity research use only.
  * Do not deploy on systems without explicit authorization.
  */
@@ -28,7 +34,7 @@
 #define DEVICE_NAME     "memdump"
 #define CLASS_NAME      "dfir"
 #define PROC_ENTRY      "memdump_info"
-#define DRIVER_VERSION  "2.0.0"
+#define DRIVER_VERSION  "2.1.0"
 
 /* Default buffer: 64MB. Override with module param. */
 #define DEFAULT_BUFFER_SIZE (64UL * 1024 * 1024)
@@ -39,6 +45,40 @@
 #define MEMDUMP_GET_TS      _IOR(MEMDUMP_IOC_MAGIC, 2, unsigned long long)
 #define MEMDUMP_GET_KVER    _IOR(MEMDUMP_IOC_MAGIC, 3, char[64])
 #define MEMDUMP_RESET       _IO(MEMDUMP_IOC_MAGIC,  4)
+
+/*
+ * kmap_local_page / kunmap_local replaced kmap_atomic / kunmap_atomic
+ * in kernel 5.11. Both are safe to use from any context; kmap_local_page
+ * is preferred from 5.11 onward as kmap_atomic was fully removed later.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
+  #define MEMDUMP_KMAP(pg)    kmap_atomic(pg)
+  #define MEMDUMP_KUNMAP(va)  kunmap_atomic(va)
+#else
+  #define MEMDUMP_KMAP(pg)    kmap_local_page(pg)
+  #define MEMDUMP_KUNMAP(va)  kunmap_local(va)
+#endif
+
+/*
+ * vm_flags became a read-only field in 6.3. Use vm_flags_set() on
+ * kernels that have it; fall back to direct assignment on older ones.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
+  #define MEMDUMP_VMA_SET_FLAGS(vma, flags) \
+      do { (vma)->vm_flags |= (flags); } while (0)
+#else
+  #define MEMDUMP_VMA_SET_FLAGS(vma, flags) \
+      vm_flags_set((vma), (flags))
+#endif
+
+/*
+ * class_create() dropped the THIS_MODULE argument in 6.4.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+  #define MEMDUMP_CLASS_CREATE(name)  class_create(name)
+#else
+  #define MEMDUMP_CLASS_CREATE(name)  class_create(THIS_MODULE, name)
+#endif
 
 /* ---- Module parameters -------------------------------------------------- */
 
@@ -58,21 +98,22 @@ static struct cdev  mem_cdev;
 static struct class *mem_class;
 static struct proc_dir_entry *proc_entry;
 
-static char          *kernel_buffer;
-static size_t         acquired_size;
-static ktime_t        acq_timestamp;
+static char   *kernel_buffer;
+static size_t  acquired_size;
+static ktime_t acq_timestamp;
 static DEFINE_MUTEX(acq_lock);
 
 /* ---- Helpers ------------------------------------------------------------- */
 
 /**
- * acquire_physical_memory - Walk PFNs and copy pages into kernel_buffer.
+ * acquire_physical_memory - Walk PFNs and copy RAM pages into kernel_buffer.
  *
- * This is a best-effort approach. Pages may be skipped if they are not
- * backed, reserved, or inaccessible (e.g. MMIO regions).
+ * Uses kmap_local_page (kernel 5.11+) or kmap_atomic (older kernels) via
+ * the MEMDUMP_KMAP / MEMDUMP_KUNMAP compatibility macros.
  *
- * In a real production tool, supplement with /proc/iomem parsing to
- * enumerate only RAM-backed regions.
+ * Reserved pages (MMIO, firmware, etc.) are skipped to avoid hangs.
+ * For production use, restrict the PFN walk to RAM regions only by
+ * parsing /proc/iomem or using for_each_mem_range().
  */
 static size_t acquire_physical_memory(char *buf, size_t max_bytes)
 {
@@ -89,13 +130,12 @@ static size_t acquire_physical_memory(char *buf, size_t max_bytes)
 
         pg = pfn_to_page(pfn);
 
-        /* Skip reserved / special pages to avoid hangs */
         if (PageReserved(pg))
             continue;
 
-        vaddr = kmap_atomic(pg);
+        vaddr = MEMDUMP_KMAP(pg);
         memcpy(buf + offset, vaddr, PAGE_SIZE);
-        kunmap_atomic(vaddr);
+        MEMDUMP_KUNMAP(vaddr);
 
         offset += PAGE_SIZE;
     }
@@ -105,8 +145,7 @@ static size_t acquire_physical_memory(char *buf, size_t max_bytes)
 
 /**
  * fill_test_pattern - Populate buffer with 0x00-0xFF cycling pattern.
- * Useful for unit-testing the acquisition pipeline without touching
- * physical memory.
+ * Use fill_pattern=1 module param to activate; avoids touching physical RAM.
  */
 static void fill_test_pattern(char *buf, size_t size)
 {
@@ -136,10 +175,9 @@ static int mem_release(struct inode *inode, struct file *file)
 }
 
 /**
- * mem_read - Copy kernel_buffer data to user space.
+ * mem_read - Copy kernel_buffer data to userspace.
  *
- * Supports arbitrary offsets so userspace can do partial/targeted reads.
- * Uses copy_to_user for safe cross-boundary transfer.
+ * Supports arbitrary offsets; forensic tools can read any region directly.
  */
 static ssize_t mem_read(struct file *file, char __user *buf,
                          size_t len, loff_t *offset)
@@ -165,7 +203,7 @@ static ssize_t mem_read(struct file *file, char __user *buf,
  * mem_mmap - Zero-copy interface: map kernel_buffer into user VMA.
  *
  * Avoids copy_to_user overhead for large dumps.
- * Requires kernel_buffer to be vmalloc'd (which it is).
+ * Uses MEMDUMP_VMA_SET_FLAGS compat macro (vm_flags read-only since 6.3).
  */
 static int mem_mmap(struct file *file, struct vm_area_struct *vma)
 {
@@ -174,22 +212,21 @@ static int mem_mmap(struct file *file, struct vm_area_struct *vma)
     if (size > acquired_size)
         return -EINVAL;
 
-    /* remap_vmalloc_range handles page-by-page PTE setup */
     if (remap_vmalloc_range(vma, kernel_buffer, vma->vm_pgoff)) {
         pr_err("[memdump] remap_vmalloc_range failed\n");
         return -EAGAIN;
     }
 
-    vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+    MEMDUMP_VMA_SET_FLAGS(vma, VM_DONTEXPAND | VM_DONTDUMP);
     pr_info("[memdump] mmap: %lu bytes mapped to userspace\n", size);
     return 0;
 }
 
 /**
- * mem_llseek - Allow seeking within the dump buffer.
+ * mem_llseek - Seek within the dump buffer.
  *
- * Enables forensic tools to jump directly to a region of interest
- * without re-reading from the start.
+ * Enables forensic tools to jump to a specific physical offset without
+ * re-reading from the start.
  */
 static loff_t mem_llseek(struct file *file, loff_t offset, int whence)
 {
@@ -197,12 +234,12 @@ static loff_t mem_llseek(struct file *file, loff_t offset, int whence)
 }
 
 /**
- * mem_ioctl - Query metadata without parsing the data stream.
+ * mem_ioctl - Query acquisition metadata without parsing the data stream.
  *
- * MEMDUMP_GET_SIZE  → total acquired bytes
- * MEMDUMP_GET_TS    → acquisition timestamp (nanoseconds since boot)
- * MEMDUMP_GET_KVER  → kernel version string (up to 64 bytes)
- * MEMDUMP_RESET     → re-run acquisition (refreshes buffer)
+ *   MEMDUMP_GET_SIZE  → total acquired bytes       (unsigned long)
+ *   MEMDUMP_GET_TS    → timestamp ns since boot    (unsigned long long)
+ *   MEMDUMP_GET_KVER  → kernel version string      (char[64])
+ *   MEMDUMP_RESET     → re-run acquisition         (no arg)
  */
 static long mem_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -235,10 +272,12 @@ static long mem_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         pr_info("[memdump] Re-acquisition requested\n");
         memset(kernel_buffer, 0, buffer_size);
         acq_timestamp = ktime_get();
-        if (fill_pattern)
+        if (fill_pattern) {
             fill_test_pattern(kernel_buffer, buffer_size);
-        else
+            acquired_size = buffer_size;
+        } else {
             acquired_size = acquire_physical_memory(kernel_buffer, buffer_size);
+        }
         pr_info("[memdump] Re-acquisition complete: %zu bytes\n", acquired_size);
         return 0;
 
@@ -294,7 +333,6 @@ static int __init memdump_init(void)
     pr_info("[memdump] Initializing v%s (buffer=%lu bytes)\n",
             DRIVER_VERSION, buffer_size);
 
-    /* --- Allocate acquisition buffer (vmalloc: no contiguity requirement) */
     kernel_buffer = vmalloc(buffer_size);
     if (!kernel_buffer) {
         pr_err("[memdump] Failed to allocate %lu bytes\n", buffer_size);
@@ -302,7 +340,6 @@ static int __init memdump_init(void)
     }
     memset(kernel_buffer, 0, buffer_size);
 
-    /* --- Perform acquisition -------------------------------------------- */
     acq_timestamp = ktime_get();
     if (fill_pattern) {
         fill_test_pattern(kernel_buffer, buffer_size);
@@ -314,7 +351,6 @@ static int __init memdump_init(void)
                 acquired_size);
     }
 
-    /* --- Register character device --------------------------------------- */
     ret = alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
     if (ret < 0) {
         pr_err("[memdump] alloc_chrdev_region failed: %d\n", ret);
@@ -328,11 +364,7 @@ static int __init memdump_init(void)
         goto err_unreg;
     }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-    mem_class = class_create(CLASS_NAME);
-#else
-    mem_class = class_create(THIS_MODULE, CLASS_NAME);
-#endif
+    mem_class = MEMDUMP_CLASS_CREATE(CLASS_NAME);
     if (IS_ERR(mem_class)) {
         ret = PTR_ERR(mem_class);
         pr_err("[memdump] class_create failed: %d\n", ret);
@@ -344,7 +376,6 @@ static int __init memdump_init(void)
         goto err_class;
     }
 
-    /* --- Create /proc entry ---------------------------------------------- */
     proc_entry = proc_create(PROC_ENTRY, 0444, NULL, &proc_fops);
     if (!proc_entry)
         pr_warn("[memdump] Failed to create /proc/%s\n", PROC_ENTRY);

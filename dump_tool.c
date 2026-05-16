@@ -1,16 +1,17 @@
 /*
  * dump_tool.c - Userspace acquisition tool for /dev/memdump
+ * Version: 2.1.0
  *
  * Features:
- *   - 1MB chunked reads (reduces syscall overhead vs 4KB)
+ *   - 1MB chunked reads (reduces syscall overhead)
  *   - mmap zero-copy mode (--mmap flag)
- *   - Inline SHA-256 hashing (OpenSSL)
+ *   - Inline SHA-256 hashing via OpenSSL 3.0 EVP API
  *   - Progress reporting
  *   - ioctl metadata query
- *   - Chain-of-custody output (JSON sidecar)
+ *   - Chain-of-custody JSON sidecar
  *
  * Build:
- *   gcc -O2 -Wall dump_tool.c -lssl -lcrypto -o dump_tool
+ *   gcc -O2 -Wall -std=c11 dump_tool.c -lssl -lcrypto -o dump_tool
  *
  * Usage:
  *   sudo ./dump_tool [--mmap] [--out <file>]
@@ -38,6 +39,7 @@
 
 /* ---- Constants ---------------------------------------------------------- */
 
+#define TOOL_VERSION    "2.1.0"
 #define DEVICE_PATH     "/dev/memdump"
 #define DEFAULT_OUTPUT  "memory_dump.bin"
 #define SIDECAR_EXT     ".json"
@@ -56,8 +58,8 @@ static void progress(size_t done, size_t total)
 {
     double pct = total ? (100.0 * done / total) : 0.0;
     fprintf(stderr, "\r  Acquired: %6.1f MB / %6.1f MB  [%5.1f%%]",
-            done   / (1024.0 * 1024.0),
-            total  / (1024.0 * 1024.0),
+            done  / (1024.0 * 1024.0),
+            total / (1024.0 * 1024.0),
             pct);
     fflush(stderr);
 }
@@ -76,7 +78,7 @@ static void write_sidecar(const char *out_path,
     FILE *f;
     time_t now = time(NULL);
     char timebuf[64];
-    size_t i;
+    unsigned int i;
 
     snprintf(sidecar_path, sizeof(sidecar_path), "%s%s", out_path, SIDECAR_EXT);
     f = fopen(sidecar_path, "w");
@@ -88,7 +90,7 @@ static void write_sidecar(const char *out_path,
     strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
 
     fprintf(f, "{\n");
-    fprintf(f, "  \"tool\"            : \"memdump dump_tool v2.0.0\",\n");
+    fprintf(f, "  \"tool\"            : \"memdump dump_tool v%s\",\n", TOOL_VERSION);
     fprintf(f, "  \"output_file\"     : \"%s\",\n", out_path);
     fprintf(f, "  \"acquired_bytes\"  : %zu,\n", acquired);
     fprintf(f, "  \"kernel_version\"  : \"%s\",\n", kver);
@@ -107,8 +109,6 @@ static void write_sidecar(const char *out_path,
 
 /**
  * acquire_chunked - Standard read()-based acquisition with 1MB chunks.
- *
- * Lower overhead than 4KB reads (fewer syscalls, better throughput).
  */
 static int acquire_chunked(int fd, FILE *out,
                             size_t total_size,
@@ -147,7 +147,7 @@ static int acquire_chunked(int fd, FILE *out,
  * acquire_mmap - Zero-copy acquisition via mmap.
  *
  * Avoids copy_to_user + read() overhead entirely.
- * Best for large dumps on memory-constrained systems.
+ * Falls back to acquire_chunked if mmap fails.
  */
 static int acquire_mmap(int fd, FILE *out,
                          size_t total_size,
@@ -159,7 +159,7 @@ static int acquire_mmap(int fd, FILE *out,
     int ret = 0;
 
     if (total_size == 0) {
-        fprintf(stderr, "  [mmap] Cannot determine size; falling back to read()\n");
+        fprintf(stderr, "  [mmap] Size unknown; falling back to read()\n");
         return acquire_chunked(fd, out, 0, sha_ctx);
     }
 
@@ -170,7 +170,6 @@ static int acquire_mmap(int fd, FILE *out,
         return acquire_chunked(fd, out, total_size, sha_ctx);
     }
 
-    /* Advise sequential access pattern for prefetch */
     madvise(mapped, total_size, MADV_SEQUENTIAL);
 
     while (offset < total_size) {
@@ -202,13 +201,13 @@ int main(int argc, char *argv[])
     int use_mmap = 0;
     const char *out_path = DEFAULT_OUTPUT;
 
-    EVP_MD_CTX *sha_ctx;
+    EVP_MD_CTX   *sha_ctx;
     unsigned char sha256[EVP_MAX_MD_SIZE];
     unsigned int  sha256_len = 0;
 
-    size_t total_size        = 0;
-    unsigned long long ts_ns = 0;
-    char kver[64]            = "unknown";
+    size_t             total_size = 0;
+    unsigned long long ts_ns      = 0;
+    char               kver[64]   = "unknown";
 
     /* ---- Parse arguments ------------------------------------------------ */
     for (int i = 1; i < argc; i++) {
@@ -239,7 +238,7 @@ int main(int argc, char *argv[])
     if (ioctl(fd, MEMDUMP_GET_KVER, kver) < 0)
         perror("ioctl MEMDUMP_GET_KVER (non-fatal)");
 
-    printf("\n=== memdump Acquisition Tool v2.0.0 ===\n");
+    printf("\n=== memdump Acquisition Tool v%s ===\n", TOOL_VERSION);
     printf("  Device:         %s\n", DEVICE_PATH);
     printf("  Output:         %s\n", out_path);
     printf("  Kernel:         %s\n", kver);
@@ -254,7 +253,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* ---- Acquire -------------------------------------------------------- */
+    /* ---- Initialise SHA-256 (OpenSSL 3.0 EVP API) ---------------------- */
     sha_ctx = EVP_MD_CTX_new();
     if (!sha_ctx) {
         fprintf(stderr, "EVP_MD_CTX_new failed\n");
@@ -264,6 +263,7 @@ int main(int argc, char *argv[])
     }
     EVP_DigestInit_ex(sha_ctx, EVP_sha256(), NULL);
 
+    /* ---- Acquire -------------------------------------------------------- */
     int ret = use_mmap
         ? acquire_mmap(fd, out, total_size, sha_ctx)
         : acquire_chunked(fd, out, total_size, sha_ctx);
@@ -272,6 +272,7 @@ int main(int argc, char *argv[])
     close(fd);
 
     if (ret != 0) {
+        EVP_MD_CTX_free(sha_ctx);
         fprintf(stderr, "Acquisition failed.\n");
         return 1;
     }
@@ -280,7 +281,7 @@ int main(int argc, char *argv[])
     EVP_DigestFinal_ex(sha_ctx, sha256, &sha256_len);
     EVP_MD_CTX_free(sha_ctx);
 
-    /* Get actual written size from output file */
+    /* ---- Report --------------------------------------------------------- */
     struct stat st;
     size_t actual_size = 0;
     if (stat(out_path, &st) == 0)
@@ -291,7 +292,6 @@ int main(int argc, char *argv[])
     print_hash(sha256, sha256_len);
     printf("\n\n");
 
-    /* ---- Write chain-of-custody sidecar --------------------------------- */
     write_sidecar(out_path, actual_size, ts_ns, kver, sha256, sha256_len);
 
     printf("Done.\n\n");
