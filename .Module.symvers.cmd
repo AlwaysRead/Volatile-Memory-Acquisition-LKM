@@ -1,1 +1,0 @@
-savedcmd_Module.symvers :=  /usr/lib/modules/7.0.5-arch1-1-g14/build/scripts/mod/modpost -M    -a    -N  -o Module.symvers -n -T modules.order -i /usr/lib/modules/7.0.5-arch1-1-g14/build/Module.symvers -e 

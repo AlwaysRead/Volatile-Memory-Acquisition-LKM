@@ -1,1 +1,0 @@
-./mem_acquire.o
