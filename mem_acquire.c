@@ -180,7 +180,7 @@ static int mem_mmap(struct file *file, struct vm_area_struct *vma)
         return -EAGAIN;
     }
 
-    vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+    vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
     pr_info("[memdump] mmap: %lu bytes mapped to userspace\n", size);
     return 0;
 }
@@ -287,7 +287,7 @@ static const struct proc_ops proc_fops = {
 
 /* ---- Module init / exit -------------------------------------------------- */
 
-static int __init mem_init(void)
+static int __init memdump_init(void)
 {
     int ret;
 
@@ -363,7 +363,7 @@ err_vfree:
     return ret;
 }
 
-static void __exit mem_exit(void)
+static void __exit memdump_exit(void)
 {
     if (proc_entry)
         remove_proc_entry(PROC_ENTRY, NULL);
@@ -377,8 +377,8 @@ static void __exit mem_exit(void)
     pr_info("[memdump] Module unloaded\n");
 }
 
-module_init(mem_init);
-module_exit(mem_exit);
+module_init(memdump_init);
+module_exit(memdump_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Cybersecurity Research");
