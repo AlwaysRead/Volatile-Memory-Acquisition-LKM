@@ -13,7 +13,7 @@ KDIR      := /lib/modules/$(shell uname -r)/build
 PWD       := $(shell pwd)
 KMOD      := mem_acquire
 UTOOL     := dump_tool
-VERSION   := 2.1.0
+VERSION   := 1.0.0
 
 # Kernel module sources
 obj-m += $(KMOD).o

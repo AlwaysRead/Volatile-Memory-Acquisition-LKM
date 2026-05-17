@@ -3,7 +3,7 @@
 
 /*
  * dump_tool.c - Userspace acquisition tool for /dev/memdump
- * Version: 2.1.0
+ * Version: 1.0.0
  *
  * Features:
  *   - 1MB chunked reads (reduces syscall overhead)
@@ -12,6 +12,7 @@
  *   - Progress reporting
  *   - ioctl metadata query
  *   - Chain-of-custody JSON sidecar
+ *   - Automatic timestamped filenames
  *
  * Build:
  *   gcc -O2 -Wall -std=gnu11 dump_tool.c -lssl -lcrypto -o dump_tool
@@ -43,7 +44,7 @@
 
 /* ---- Constants ---------------------------------------------------------- */
 
-#define TOOL_VERSION    "2.1.0"
+#define TOOL_VERSION    "1.0.0"
 #define DEVICE_PATH     "/dev/memdump"
 #define DEFAULT_OUTPUT  "memory_dump.bin"
 #define SIDECAR_EXT     ".json"
@@ -203,7 +204,9 @@ int main(int argc, char *argv[])
     int fd;
     FILE *out;
     int use_mmap = 0;
+    int use_custom_path = 0;
     const char *out_path = DEFAULT_OUTPUT;
+    char timestamped_path[512];
 
     EVP_MD_CTX   *sha_ctx;
     unsigned char sha256[EVP_MAX_MD_SIZE];
@@ -219,10 +222,20 @@ int main(int argc, char *argv[])
             use_mmap = 1;
         } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
             out_path = argv[++i];
+            use_custom_path = 1;
         } else {
             fprintf(stderr, "Usage: %s [--mmap] [--out <file>]\n", argv[0]);
             return 1;
         }
+    }
+
+    /* ---- Generate timestamped filename if not custom path -------------- */
+    if (!use_custom_path) {
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        strftime(timestamped_path, sizeof(timestamped_path),
+                 "memory_dump_%Y%m%d_%H%M%S.bin", tm_info);
+        out_path = timestamped_path;
     }
 
     /* ---- Open device ---------------------------------------------------- */

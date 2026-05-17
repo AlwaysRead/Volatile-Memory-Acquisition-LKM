@@ -1,17 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * mem_acquire.c - Read-only volatile memory acquisition LKM
- *
- * Kernel compatibility:
- *   - 5.x  : kmap_local_page (replaces kmap_atomic, removed in 5.11)
- *   - 6.3+ : vm_flags_set() (vm_flags became read-only)
- *   - 6.4+ : class_create() no longer takes THIS_MODULE
- *   - 7.x  : all of the above; tested on 7.0.0-15-generic
- *
- * For DFIR / cybersecurity research use only.
- * Do not deploy on systems without explicit authorization.
- */
-
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
@@ -34,7 +20,7 @@
 #define DEVICE_NAME     "memdump"
 #define CLASS_NAME      "dfir"
 #define PROC_ENTRY      "memdump_info"
-#define DRIVER_VERSION  "2.1.0"
+#define DRIVER_VERSION  "1.0.0"
 
 /* Default buffer: 64MB. Override with module param. */
 #define DEFAULT_BUFFER_SIZE (64UL * 1024 * 1024)
